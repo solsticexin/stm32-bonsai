@@ -28,6 +28,8 @@ mod app {
         protocol::{self, LINE_BUFFER_CAPACITY, TELEMETRY_INTERVAL_MS},
         sensors::{dht11::Dht11, Environment},
     };
+    #[cfg(feature = "dht11-log")]
+    use defmt::info;
 
     /// 共享资源：串口发送端、执行器状态以及蜂鸣器控制
     #[shared]
@@ -263,6 +265,12 @@ mod app {
             let reading = ctx.local.dht11.read(ctx.local.delay);
             ctx.shared.environment.lock(|env| match reading {
                 Ok(data) => {
+                    #[cfg(feature = "dht11-log")]
+                    info!(
+                        "DHT11 原始数据 => 温度:{}℃ 湿度:{}%",
+                        data.temperature,
+                        data.humidity
+                    );
                     env.temperature = Some(data.temperature);
                     env.humidity = Some(data.humidity);
                 }

@@ -79,7 +79,7 @@ impl Dht11 {
         let mut bytes = [0u8; 5];
         for bit_index in 0..40 {
             self.wait_for_level(true, 70, delay)?;
-            delay.delay_us(40_u32);
+            delay.delay_us(25_u32);
             let Some(pin) = self.pin.as_ref() else {
                 return Err(DhtError::Timeout);
             };

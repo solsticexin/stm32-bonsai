@@ -1289,6 +1289,7 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "cortex-m-rtic",
+ "defmt 0.3.100",
  "heapless 0.7.17",
  "nb 1.1.0",
  "panic-probe",
