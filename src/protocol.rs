@@ -76,7 +76,13 @@ pub fn send_data(
     write_option_u8(&mut buf, env.humidity)?;
     write!(
         buf,
-        ",\"soil\":null,\"lux\":null,\
+        ",\"soil\":",
+    )
+    .map_err(|_| ())?;
+    write_option_u8(&mut buf, env.soil)?;
+    write!(
+        buf,
+        ",\"lux\":null,\
          \"water\":{},\"light\":{},\"fan\":{},\"buzzer\":{}}}",
         bool_to_flag(actuators.water),
         bool_to_flag(actuators.light),

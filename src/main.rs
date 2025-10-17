@@ -4,8 +4,6 @@
 
 // 将 panic 输出到调试串口
 use panic_probe as _;
-#[cfg(feature = "dht11-log")]
-use defmt_rtt as _;
 
 // 模块化拆分：执行器控制逻辑、通信协议与传感器采集
 mod actuators;
@@ -17,7 +15,8 @@ mod app {
     use cortex_m::{asm, delay::Delay};
     use heapless::String;
     use stm32f1xx_hal::{
-        gpio::{gpioa::PA1, GpioExt, Output, PushPull},
+        adc::Adc,
+        gpio::{gpioa::PA0, gpioa::PA1, Analog, GpioExt, Output, PushPull},
         pac::{self, USART1},
         prelude::*,
         rcc::Config as RccConfig,
@@ -28,10 +27,8 @@ mod app {
     use crate::{
         actuators::{apply_action, handle_buzzer_command, ActuatorState, CommandOutcome},
         protocol::{self, LINE_BUFFER_CAPACITY, TELEMETRY_INTERVAL_MS},
-        sensors::{dht11::Dht11, Environment},
+        sensors::{dht11::Dht11, soil::SoilSensor, Environment},
     };
-    #[cfg(feature = "dht11-log")]
-    use defmt::info;
 
     /// 共享资源：串口发送端、执行器状态以及蜂鸣器控制
     #[shared]
@@ -52,6 +49,8 @@ mod app {
         telemetry_ticks: u32,
         dht11: Dht11,
         delay: Delay,
+        adc: Adc<pac::ADC1>,
+        soil_pin: PA0<Analog>,
     }
 
     /// 系统初始化：配置时钟、外设与定时器
@@ -84,7 +83,7 @@ mod app {
         buzzer_pin.set_high();
 
         // 传感器相关引脚保持占位状态，后续接入真实驱动
-        let _soil_pin = gpioa.pa0.into_analog(&mut gpioa.crl);
+        let soil_pin = gpioa.pa0.into_analog(&mut gpioa.crl);
         let dht_pin = gpiob.pb5.into_floating_input(&mut gpiob_crl);
         let _i2c_scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob_crl);
         let _i2c_sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob_crl);
@@ -109,6 +108,7 @@ mod app {
 
         // 创建基于 SYST 的延迟，用于 DHT11 微秒级时序
         let delay = Delay::new(ctx.core.SYST, rcc.clocks.sysclk().raw());
+        let adc = Adc::new(ctx.device.ADC1, &mut rcc);
 
         (
             Shared {
@@ -125,6 +125,8 @@ mod app {
                 telemetry_ticks: 0,
                 dht11,
                 delay,
+                adc,
+                soil_pin,
             },
             init::Monotonics(),
         )
@@ -235,7 +237,7 @@ mod app {
         binds = TIM2,
         priority = 2,
         shared = [tx, actuators, buzzer_pin, buzzer_pulse_ms, environment],
-        local = [telemetry_timer, telemetry_ticks, dht11, delay]
+        local = [telemetry_timer, telemetry_ticks, dht11, delay, adc, soil_pin]
     )]
     fn on_tim2(mut ctx: on_tim2::Context) {
         ctx.local
@@ -265,21 +267,20 @@ mod app {
 
             // 读取 DHT11，更新环境数据
             let reading = ctx.local.dht11.read(ctx.local.delay);
-            ctx.shared.environment.lock(|env| match reading {
-                Ok(data) => {
-                    #[cfg(feature = "dht11-log")]
-                    info!(
-                        "DHT11 原始数据 => 温度:{}℃ 湿度:{}%",
-                        data.temperature,
-                        data.humidity
-                    );
-                    env.temperature = Some(data.temperature);
-                    env.humidity = Some(data.humidity);
+            let soil_percent = SoilSensor::read_percent(&mut ctx.local.adc, &mut ctx.local.soil_pin);
+
+            ctx.shared.environment.lock(|env| {
+                match reading {
+                    Ok(data) => {
+                        env.temperature = Some(data.temperature);
+                        env.humidity = Some(data.humidity);
+                    }
+                    Err(_) => {
+                        env.temperature = None;
+                        env.humidity = None;
+                    }
                 }
-                Err(_) => {
-                    env.temperature = None;
-                    env.humidity = None;
-                }
+                env.soil = Some(soil_percent);
             });
 
             (&mut ctx.shared.tx, &mut ctx.shared.actuators, &mut ctx.shared.environment)
