@@ -2,15 +2,17 @@
 #![no_main]
 #![no_std]
 
-// Print panic message to probe console
+// 将 panic 输出到调试串口
 use panic_probe as _;
+
+// 模块化拆分：执行器控制逻辑与通信协议处理
+mod actuators;
+mod protocol;
 
 #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true)]
 mod app {
-    use core::fmt::Write;
-
+    use cortex_m::asm;
     use heapless::String;
-    use nb::block;
     use stm32f1xx_hal::{
         gpio::{gpioa::PA1, GpioExt, Output, PushPull},
         pac::{self, USART1},
@@ -20,50 +22,12 @@ mod app {
         timer::{CounterHz, Event as TimerEvent, Timer},
     };
 
-    use cortex_m::asm;
-    use serde::Deserialize;
-    use serde_json_core::de::from_str;
+    use crate::{
+        actuators::{apply_action, handle_buzzer_command, ActuatorState, CommandOutcome},
+        protocol::{self, LINE_BUFFER_CAPACITY, TELEMETRY_INTERVAL_MS},
+    };
 
-    const LINE_BUFFER_CAPACITY: usize = 192;
-    const TX_BUFFER_CAPACITY: usize = 192;
-    const TELEMETRY_INTERVAL_MS: u32 = 5_000;
-    const MIN_PULSE_MS: u32 = 1;
-    const MAX_PULSE_MS: u32 = 10_000;
-
-    #[derive(Clone, Copy, Default)]
-    pub struct ActuatorState {
-        water: bool,
-        light: bool,
-        fan: bool,
-        buzzer: bool,
-    }
-
-    impl ActuatorState {
-        fn water(&mut self) -> &mut bool {
-            &mut self.water
-        }
-
-        fn light(&mut self) -> &mut bool {
-            &mut self.light
-        }
-
-        fn fan(&mut self) -> &mut bool {
-            &mut self.fan
-        }
-    }
-
-    #[derive(Deserialize)]
-    struct CommandFrame<'a> {
-        #[serde(rename = "type")]
-        kind: &'a str,
-        #[serde(default)]
-        target: Option<&'a str>,
-        #[serde(default)]
-        action: Option<&'a str>,
-        #[serde(default)]
-        time: Option<u32>,
-    }
-
+    /// 共享资源：串口发送端、执行器状态以及蜂鸣器控制
     #[shared]
     struct Shared {
         tx: Tx<USART1>,
@@ -72,6 +36,7 @@ mod app {
         buzzer_pulse_ms: Option<u32>,
     }
 
+    /// 本地资源：串口接收端、接收缓冲以及定时器
     #[local]
     struct Local {
         rx: Rx<USART1>,
@@ -80,8 +45,10 @@ mod app {
         telemetry_ticks: u32,
     }
 
+    /// 系统初始化：配置时钟、外设与定时器
     #[init]
     fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
+        // 配置外部 8MHz 晶振，并将系统时钟提升到 72MHz
         let mut flash = ctx.device.FLASH.constrain();
         let mut rcc = ctx
             .device
@@ -94,23 +61,26 @@ mod app {
                 &mut flash.acr,
             );
 
+        // 拆分 GPIO 寄存器，准备配置所需引脚
         let mut gpioa = ctx.device.GPIOA.split(&mut rcc);
         let mut gpiob = ctx.device.GPIOB.split(&mut rcc);
 
+        // 执行器输出引脚，其中蜂鸣器为低电平触发，因此默认拉高关闭
         let _water_pin = gpiob.pb0.into_push_pull_output(&mut gpiob.crl);
         let _light_pin = gpiob.pb1.into_push_pull_output(&mut gpiob.crl);
         let _fan_pin = gpiob.pb10.into_push_pull_output(&mut gpiob.crh);
         let mut buzzer_pin = gpioa.pa1.into_push_pull_output(&mut gpioa.crl);
         buzzer_pin.set_high();
 
+        // 传感器相关引脚保持占位状态，后续接入真实驱动
         let _soil_pin = gpioa.pa0.into_analog(&mut gpioa.crl);
         let _dht11_pin = gpiob.pb5.into_open_drain_output(&mut gpiob.crl);
         let _i2c_scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
         let _i2c_sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
 
+        // USART1：PA9 / PA10 作为 TX / RX
         let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
         let rx_pin = gpioa.pa10;
-
         let mut serial = Serial::new(
             ctx.device.USART1,
             (tx_pin, rx_pin),
@@ -120,6 +90,7 @@ mod app {
         serial.listen(SerialEvent::Rxne);
         let (tx, rx) = serial.split();
 
+        // TIM2 作为 1kHz 基准计时器，用于遥测与蜂鸣器脉冲计时
         let mut telemetry_timer = Timer::new(ctx.device.TIM2, &mut rcc).counter_hz();
         telemetry_timer.listen(TimerEvent::Update);
         let _ = telemetry_timer.start(1_000.Hz());
@@ -141,6 +112,7 @@ mod app {
         )
     }
 
+    /// 空闲任务保持低功耗等待
     #[idle]
     fn idle(_: idle::Context) -> ! {
         loop {
@@ -148,6 +120,7 @@ mod app {
         }
     }
 
+    /// 串口中断任务：接收并解析来自 ESP 的指令
     #[task(
         binds = USART1,
         priority = 3,
@@ -160,7 +133,7 @@ mod app {
                 b'\n' => {
                     if !ctx.local.line_buf.is_empty() {
                         let line = ctx.local.line_buf.as_str();
-                        if let Ok((frame, _)) = from_str::<CommandFrame>(line) {
+                        if let Ok(frame) = protocol::parse_command_line(line) {
                             if frame.kind == "cmd" {
                                 if let (Some(target), Some(action)) =
                                     (frame.target, frame.action)
@@ -203,7 +176,7 @@ mod app {
                                         };
 
                                     ctx.shared.tx.lock(|tx| {
-                                        let _ = send_ack(
+                                        let _ = protocol::send_ack(
                                             tx,
                                             Some(target),
                                             Some(action),
@@ -213,7 +186,7 @@ mod app {
                                     });
                                 } else {
                                     ctx.shared.tx.lock(|tx| {
-                                        let _ = send_ack(
+                                        let _ = protocol::send_ack(
                                             tx,
                                             frame.target,
                                             frame.action,
@@ -239,87 +212,7 @@ mod app {
         }
     }
 
-    enum CommandOutcome {
-        Applied(Option<&'static str>),
-        Error(&'static str),
-    }
-
-    fn apply_action(state: &mut ActuatorState, target: &str, action: &str) -> CommandOutcome {
-        match target {
-            "water" => apply_binary_action(state.water(), action),
-            "light" => apply_binary_action(state.light(), action),
-            "fan" => apply_binary_action(state.fan(), action),
-            _ => CommandOutcome::Error("unknown target"),
-        }
-    }
-
-    fn apply_binary_action(flag: &mut bool, action: &str) -> CommandOutcome {
-        match action {
-            "on" => {
-                if *flag {
-                    CommandOutcome::Applied(Some("already on"))
-                } else {
-                    *flag = true;
-                    CommandOutcome::Applied(None)
-                }
-            }
-            "off" => {
-                if !*flag {
-                    CommandOutcome::Applied(Some("already off"))
-                } else {
-                    *flag = false;
-                    CommandOutcome::Applied(None)
-                }
-            }
-            "pulse" => CommandOutcome::Error("pulse action not implemented"),
-            _ => CommandOutcome::Error("unsupported action"),
-        }
-    }
-
-    fn handle_buzzer_command(
-        state: &mut ActuatorState,
-        buzzer: &mut PA1<Output<PushPull>>,
-        pulse_ms: &mut Option<u32>,
-        action: &str,
-        duration_ms: Option<u32>,
-    ) -> CommandOutcome {
-        match action {
-            "on" => {
-                if state.buzzer {
-                    CommandOutcome::Applied(Some("already on"))
-                } else {
-                    state.buzzer = true;
-                    *pulse_ms = None;
-                    buzzer.set_low();
-                    CommandOutcome::Applied(None)
-                }
-            }
-            "off" => {
-                if !state.buzzer {
-                    CommandOutcome::Applied(Some("already off"))
-                } else {
-                    state.buzzer = false;
-                    *pulse_ms = None;
-                    buzzer.set_high();
-                    CommandOutcome::Applied(None)
-                }
-            }
-            "pulse" => {
-                let ms = match duration_ms {
-                    Some(value) if (MIN_PULSE_MS..=MAX_PULSE_MS).contains(&value) => value,
-                    Some(_) => return CommandOutcome::Error("pulse time out of range"),
-                    None => return CommandOutcome::Error("missing pulse time"),
-                };
-
-                state.buzzer = true;
-                *pulse_ms = Some(ms);
-                buzzer.set_low();
-                CommandOutcome::Applied(Some("pulsing"))
-            }
-            _ => CommandOutcome::Error("unsupported action"),
-        }
-    }
-
+    /// TIM2 中断：负责蜂鸣器脉冲计时及周期性遥测输出
     #[task(
         binds = TIM2,
         priority = 2,
@@ -333,6 +226,7 @@ mod app {
 
         *ctx.local.telemetry_ticks = ctx.local.telemetry_ticks.wrapping_add(1);
 
+        // 蜂鸣器脉冲倒计时：计数归零后自动释放
         (&mut ctx.shared.buzzer_pin, &mut ctx.shared.buzzer_pulse_ms, &mut ctx.shared.actuators)
             .lock(|buzzer_pin, pulse_ms, actuators| {
                 if let Some(remaining) = pulse_ms.as_mut() {
@@ -347,80 +241,12 @@ mod app {
                 }
             });
 
+        // 每 TELEMETRY_INTERVAL_MS 毫秒上报一次执行器状态
         if *ctx.local.telemetry_ticks >= TELEMETRY_INTERVAL_MS {
             *ctx.local.telemetry_ticks = 0;
             (&mut ctx.shared.tx, &mut ctx.shared.actuators).lock(|tx, actuators| {
-                let state = *actuators;
-                let _ = send_data(tx, state);
+                let _ = protocol::send_data(tx, actuators);
             });
-        }
-    }
-
-    fn send_ack(
-        tx: &mut Tx<USART1>,
-        target: Option<&str>,
-        action: Option<&str>,
-        result: &'static str,
-        message: Option<&'static str>,
-    ) -> Result<(), ()> {
-        let mut buf: String<TX_BUFFER_CAPACITY> = String::new();
-        write!(buf, "{{\"type\":\"ack\",\"target\":").map_err(|_| ())?;
-        write_option_string(&mut buf, target)?;
-        write!(buf, ",\"action\":").map_err(|_| ())?;
-        write_option_string(&mut buf, action)?;
-        write!(buf, ",\"result\":\"{}\"", result).map_err(|_| ())?;
-        write!(buf, ",\"message\":").map_err(|_| ())?;
-        write_option_string(&mut buf, message)?;
-        buf.push('}').map_err(|_| ())?;
-
-        transmit_line(tx, buf.as_bytes());
-        Ok(())
-    }
-
-    fn send_data(tx: &mut Tx<USART1>, state: ActuatorState) -> Result<(), ()> {
-        let mut buf: String<TX_BUFFER_CAPACITY> = String::new();
-        // Sensor fields remain null until their drivers are wired up.
-        write!(
-            buf,
-            "{{\"type\":\"data\",\"temp\":null,\"humi\":null,\"soil\":null,\"lux\":null,\
-             \"water\":{},\"light\":{},\"fan\":{},\"buzzer\":{}}}",
-            bool_to_flag(state.water),
-            bool_to_flag(state.light),
-            bool_to_flag(state.fan),
-            bool_to_flag(state.buzzer)
-        )
-        .map_err(|_| ())?;
-        transmit_line(tx, buf.as_bytes());
-        Ok(())
-    }
-
-    fn write_option_string<const N: usize>(
-        buf: &mut String<N>,
-        value: Option<&str>,
-    ) -> Result<(), ()> {
-        match value {
-            Some(text) => {
-                write!(buf, "\"{}\"", text).map_err(|_| ())
-            }
-            None => {
-                buf.push_str("null").map_err(|_| ())
-            }
-        }
-    }
-
-    fn transmit_line(tx: &mut Tx<USART1>, payload: &[u8]) {
-        for byte in payload {
-            let _ = block!(tx.write_u8(*byte));
-        }
-        let _ = block!(tx.write_u8(b'\n'));
-        let _ = block!(tx.flush());
-    }
-
-    const fn bool_to_flag(value: bool) -> u8 {
-        if value {
-            1
-        } else {
-            0
         }
     }
 }
