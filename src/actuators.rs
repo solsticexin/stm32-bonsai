@@ -35,6 +35,17 @@ impl ActuatorState {
     pub fn fan(&mut self) -> &mut bool {
         &mut self.fan
     }
+
+    /// 获取指定执行器当前状态
+    pub fn state(&self, target: &str) -> Option<bool> {
+        match target {
+            "water" => Some(self.water),
+            "light" => Some(self.light),
+            "fan" => Some(self.fan),
+            "buzzer" => Some(self.buzzer),
+            _ => None,
+        }
+    }
 }
 
 /// 指令执行结果，用于生成 ACK 信息

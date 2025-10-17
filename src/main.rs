@@ -41,6 +41,9 @@ mod app {
         environment: Environment,
         buzzer_pin: PA1<Output<PushPull>>,
         buzzer_pulse_ms: Option<u32>,
+        water_pin: stm32f1xx_hal::gpio::gpiob::PB0<Output<PushPull>>,
+        light_pin: stm32f1xx_hal::gpio::gpiob::PB1<Output<PushPull>>,
+        fan_pin: stm32f1xx_hal::gpio::gpiob::PB10<Output<PushPull>>,
     }
 
     /// 本地资源：串口接收端、接收缓冲以及定时器
@@ -80,9 +83,12 @@ mod app {
         let mut gpiob_crh = gpiob.crh;
 
         // 执行器输出引脚，其中蜂鸣器为低电平触发，因此默认拉高关闭
-        let _water_pin = gpiob.pb0.into_push_pull_output(&mut gpiob_crl);
-        let _light_pin = gpiob.pb1.into_push_pull_output(&mut gpiob_crl);
-        let _fan_pin = gpiob.pb10.into_push_pull_output(&mut gpiob_crh);
+        let mut water_pin = gpiob.pb0.into_push_pull_output(&mut gpiob_crl);
+        water_pin.set_low();
+        let mut light_pin = gpiob.pb1.into_push_pull_output(&mut gpiob_crl);
+        light_pin.set_low();
+        let mut fan_pin = gpiob.pb10.into_push_pull_output(&mut gpiob_crh);
+        fan_pin.set_low();
         let mut buzzer_pin = gpioa.pa1.into_push_pull_output(&mut gpioa.crl);
         buzzer_pin.set_high();
 
@@ -128,6 +134,9 @@ mod app {
                 environment: Environment::default(),
                 buzzer_pin,
                 buzzer_pulse_ms: None,
+                water_pin,
+                light_pin,
+                fan_pin,
             },
             Local {
                 rx,
@@ -156,7 +165,15 @@ mod app {
     #[task(
         binds = USART1,
         priority = 3,
-        shared = [tx, actuators, buzzer_pin, buzzer_pulse_ms],
+        shared = [
+            tx,
+            actuators,
+            buzzer_pin,
+            buzzer_pulse_ms,
+            water_pin,
+            light_pin,
+            fan_pin
+        ],
         local = [rx, line_buf]
     )]
     fn on_usart1(mut ctx: on_usart1::Context) {
@@ -195,9 +212,48 @@ mod app {
                                                 }
                                             }
                                         } else {
+                                            let mut new_state = None;
                                             let outcome = ctx.shared.actuators.lock(|actuators| {
-                                                apply_action(actuators, target, action)
+                                                let out = apply_action(actuators, target, action);
+                                                new_state = actuators.state(target);
+                                                out
                                             });
+
+                                            if let Some(state) = new_state {
+                                                match target {
+                                                    "water" => ctx
+                                                        .shared
+                                                        .water_pin
+                                                        .lock(|pin| {
+                                                            if state {
+                                                                pin.set_high();
+                                                            } else {
+                                                                pin.set_low();
+                                                            }
+                                                        }),
+                                                    "light" => ctx
+                                                        .shared
+                                                        .light_pin
+                                                        .lock(|pin| {
+                                                            if state {
+                                                                pin.set_high();
+                                                            } else {
+                                                                pin.set_low();
+                                                            }
+                                                        }),
+                                                    "fan" => ctx
+                                                        .shared
+                                                        .fan_pin
+                                                        .lock(|pin| {
+                                                            if state {
+                                                                pin.set_high();
+                                                            } else {
+                                                                pin.set_low();
+                                                            }
+                                                        }),
+                                                    _ => {}
+                                                }
+                                            }
 
                                             match outcome {
                                                 CommandOutcome::Applied(msg) => ("ok", msg),
@@ -248,7 +304,16 @@ mod app {
     #[task(
         binds = TIM2,
         priority = 2,
-        shared = [tx, actuators, buzzer_pin, buzzer_pulse_ms, environment],
+        shared = [
+            tx,
+            actuators,
+            buzzer_pin,
+            buzzer_pulse_ms,
+            environment,
+            water_pin,
+            light_pin,
+            fan_pin
+        ],
         local = [telemetry_timer, telemetry_ticks, dht11, delay, adc, soil_pin, i2c]
     )]
     fn on_tim2(mut ctx: on_tim2::Context) {
