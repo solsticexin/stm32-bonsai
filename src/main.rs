@@ -4,6 +4,8 @@
 
 // 将 panic 输出到调试串口
 use panic_probe as _;
+#[cfg(feature = "dht11-log")]
+use defmt_rtt as _;
 
 // 模块化拆分：执行器控制逻辑、通信协议与传感器采集
 mod actuators;
