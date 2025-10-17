@@ -17,6 +17,7 @@ mod app {
     use stm32f1xx_hal::{
         adc::Adc,
         gpio::{gpioa::PA0, gpioa::PA1, Analog, GpioExt, Output, PushPull},
+        i2c::{I2c, Mode},
         pac::{self, USART1},
         prelude::*,
         rcc::Config as RccConfig,
@@ -27,10 +28,12 @@ mod app {
     use crate::{
         actuators::{apply_action, handle_buzzer_command, ActuatorState, CommandOutcome},
         protocol::{self, LINE_BUFFER_CAPACITY, TELEMETRY_INTERVAL_MS},
-        sensors::{dht11::Dht11, soil::SoilSensor, Environment},
+        sensors::{bh1750::Bh1750, dht11::Dht11, soil::SoilSensor, Environment},
     };
 
     /// 共享资源：串口发送端、执行器状态以及蜂鸣器控制
+    type LightI2c = I2c<pac::I2C1>;
+
     #[shared]
     struct Shared {
         tx: Tx<USART1>,
@@ -51,6 +54,7 @@ mod app {
         delay: Delay,
         adc: Adc<pac::ADC1>,
         soil_pin: PA0<Analog>,
+        i2c: LightI2c,
     }
 
     /// 系统初始化：配置时钟、外设与定时器
@@ -85,9 +89,16 @@ mod app {
         // 传感器相关引脚保持占位状态，后续接入真实驱动
         let soil_pin = gpioa.pa0.into_analog(&mut gpioa.crl);
         let dht_pin = gpiob.pb5.into_floating_input(&mut gpiob_crl);
-        let _i2c_scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob_crl);
-        let _i2c_sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob_crl);
+        let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob_crl);
+        let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob_crl);
         let dht11 = Dht11::new(dht_pin, gpiob_crl);
+        let mut i2c = I2c::new(
+            ctx.device.I2C1,
+            (scl, sda),
+            Mode::standard(100.kHz()),
+            &mut rcc,
+        );
+        let _ = Bh1750::init(&mut i2c);
 
         // USART1：PA9 / PA10 作为 TX / RX
         let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
@@ -127,6 +138,7 @@ mod app {
                 delay,
                 adc,
                 soil_pin,
+                i2c,
             },
             init::Monotonics(),
         )
@@ -237,7 +249,7 @@ mod app {
         binds = TIM2,
         priority = 2,
         shared = [tx, actuators, buzzer_pin, buzzer_pulse_ms, environment],
-        local = [telemetry_timer, telemetry_ticks, dht11, delay, adc, soil_pin]
+        local = [telemetry_timer, telemetry_ticks, dht11, delay, adc, soil_pin, i2c]
     )]
     fn on_tim2(mut ctx: on_tim2::Context) {
         ctx.local
@@ -267,7 +279,9 @@ mod app {
 
             // 读取 DHT11，更新环境数据
             let reading = ctx.local.dht11.read(ctx.local.delay);
-            let soil_percent = SoilSensor::read_percent(&mut ctx.local.adc, &mut ctx.local.soil_pin);
+            let soil_percent =
+                SoilSensor::read_percent(&mut ctx.local.adc, &mut ctx.local.soil_pin);
+            let lux_result = Bh1750::read_lux(&mut ctx.local.i2c, ctx.local.delay);
 
             ctx.shared.environment.lock(|env| {
                 match reading {
@@ -281,6 +295,7 @@ mod app {
                     }
                 }
                 env.soil = Some(soil_percent);
+                env.lux = lux_result.ok();
             });
 
             (&mut ctx.shared.tx, &mut ctx.shared.actuators, &mut ctx.shared.environment)

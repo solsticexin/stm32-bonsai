@@ -82,8 +82,13 @@ pub fn send_data(
     write_option_u8(&mut buf, env.soil)?;
     write!(
         buf,
-        ",\"lux\":null,\
-         \"water\":{},\"light\":{},\"fan\":{},\"buzzer\":{}}}",
+        ",\"lux\":",
+    )
+    .map_err(|_| ())?;
+    write_option_u16(&mut buf, env.lux)?;
+    write!(
+        buf,
+        ",\"water\":{},\"light\":{},\"fan\":{},\"buzzer\":{}}}",
         bool_to_flag(actuators.water),
         bool_to_flag(actuators.light),
         bool_to_flag(actuators.fan),
@@ -105,6 +110,13 @@ fn write_option_string<const N: usize>(
 }
 
 fn write_option_u8<const N: usize>(buf: &mut String<N>, value: Option<u8>) -> Result<(), ()> {
+    match value {
+        Some(v) => write!(buf, "{}", v).map_err(|_| ()),
+        None => buf.push_str("null").map_err(|_| ()),
+    }
+}
+
+fn write_option_u16<const N: usize>(buf: &mut String<N>, value: Option<u16>) -> Result<(), ()> {
     match value {
         Some(v) => write!(buf, "{}", v).map_err(|_| ()),
         None => buf.push_str("null").map_err(|_| ()),
