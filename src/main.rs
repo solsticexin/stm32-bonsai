@@ -16,7 +16,12 @@ mod app {
     use heapless::String;
     use stm32f1xx_hal::{
         adc::Adc,
-        gpio::{gpioa::PA0, gpioa::PA1, Analog, GpioExt, Output, PushPull},
+        gpio::{
+            gpioa::PA0,
+            gpioa::PA1,
+            gpiob::{PB0, PB1, PB10},
+            Analog, GpioExt, Output, PushPull,
+        },
         i2c::{I2c, Mode},
         pac::{self, USART1},
         prelude::*,
@@ -26,7 +31,10 @@ mod app {
     };
 
     use crate::{
-        actuators::{apply_action, handle_buzzer_command, ActuatorState, CommandOutcome},
+        actuators::{
+            apply_action, handle_buzzer_command, ActuatorState, CommandOutcome, MAX_PULSE_MS,
+            MIN_PULSE_MS,
+        },
         protocol::{self, LINE_BUFFER_CAPACITY, TELEMETRY_INTERVAL_MS},
         sensors::{bh1750::Bh1750, dht11::Dht11, soil::SoilSensor, Environment},
     };
@@ -41,9 +49,12 @@ mod app {
         environment: Environment,
         buzzer_pin: PA1<Output<PushPull>>,
         buzzer_pulse_ms: Option<u32>,
-        water_pin: stm32f1xx_hal::gpio::gpiob::PB0<Output<PushPull>>,
-        light_pin: stm32f1xx_hal::gpio::gpiob::PB1<Output<PushPull>>,
-        fan_pin: stm32f1xx_hal::gpio::gpiob::PB10<Output<PushPull>>,
+        water_pin: PB0<Output<PushPull>>,
+        light_pin: PB1<Output<PushPull>>,
+        fan_pin: PB10<Output<PushPull>>,
+        water_pulse_ms: Option<u32>,
+        light_pulse_ms: Option<u32>,
+        fan_pulse_ms: Option<u32>,
     }
 
     /// 本地资源：串口接收端、接收缓冲以及定时器
@@ -137,6 +148,9 @@ mod app {
                 water_pin,
                 light_pin,
                 fan_pin,
+                water_pulse_ms: None,
+                light_pulse_ms: None,
+                fan_pulse_ms: None,
             },
             Local {
                 rx,
@@ -172,7 +186,10 @@ mod app {
             buzzer_pulse_ms,
             water_pin,
             light_pin,
-            fan_pin
+            fan_pin,
+            water_pulse_ms,
+            light_pulse_ms,
+            fan_pulse_ms
         ],
         local = [rx, line_buf]
     )]
@@ -211,6 +228,59 @@ mod app {
                                                     ("error", Some(msg))
                                                 }
                                             }
+                                        } else if matches!(target, "water" | "light" | "fan")
+                                            && action == "pulse"
+                                        {
+                                            let duration = match frame.time {
+                                                Some(value)
+                                                    if (MIN_PULSE_MS..=MAX_PULSE_MS)
+                                                        .contains(&value) =>
+                                                {
+                                                    Ok(value)
+                                                }
+                                                Some(_) => Err("pulse time out of range"),
+                                                None => Err("missing pulse time"),
+                                            };
+
+                                            match duration {
+                                                Ok(ms) => {
+                                                    match target {
+                                                        "water" => (
+                                                            &mut ctx.shared.water_pin,
+                                                            &mut ctx.shared.water_pulse_ms,
+                                                            &mut ctx.shared.actuators,
+                                                        )
+                                                            .lock(|pin, pulse_ms, actuators| {
+                                                                pin.set_high();
+                                                                *pulse_ms = Some(ms);
+                                                                *actuators.water() = true;
+                                                            }),
+                                                        "light" => (
+                                                            &mut ctx.shared.light_pin,
+                                                            &mut ctx.shared.light_pulse_ms,
+                                                            &mut ctx.shared.actuators,
+                                                        )
+                                                            .lock(|pin, pulse_ms, actuators| {
+                                                                pin.set_high();
+                                                                *pulse_ms = Some(ms);
+                                                                *actuators.light() = true;
+                                                            }),
+                                                        "fan" => (
+                                                            &mut ctx.shared.fan_pin,
+                                                            &mut ctx.shared.fan_pulse_ms,
+                                                            &mut ctx.shared.actuators,
+                                                        )
+                                                            .lock(|pin, pulse_ms, actuators| {
+                                                                pin.set_high();
+                                                                *pulse_ms = Some(ms);
+                                                                *actuators.fan() = true;
+                                                            }),
+                                                        _ => {}
+                                                    }
+                                                    ("ok", Some("pulsing"))
+                                                }
+                                                Err(msg) => ("error", Some(msg)),
+                                            }
                                         } else {
                                             let mut new_state = None;
                                             let outcome = ctx.shared.actuators.lock(|actuators| {
@@ -221,35 +291,41 @@ mod app {
 
                                             if let Some(state) = new_state {
                                                 match target {
-                                                    "water" => ctx
-                                                        .shared
-                                                        .water_pin
-                                                        .lock(|pin| {
+                                                    "water" => (
+                                                        &mut ctx.shared.water_pin,
+                                                        &mut ctx.shared.water_pulse_ms,
+                                                    )
+                                                        .lock(|pin, pulse_ms| {
                                                             if state {
                                                                 pin.set_high();
                                                             } else {
                                                                 pin.set_low();
                                                             }
+                                                            *pulse_ms = None;
                                                         }),
-                                                    "light" => ctx
-                                                        .shared
-                                                        .light_pin
-                                                        .lock(|pin| {
+                                                    "light" => (
+                                                        &mut ctx.shared.light_pin,
+                                                        &mut ctx.shared.light_pulse_ms,
+                                                    )
+                                                        .lock(|pin, pulse_ms| {
                                                             if state {
                                                                 pin.set_high();
                                                             } else {
                                                                 pin.set_low();
                                                             }
+                                                            *pulse_ms = None;
                                                         }),
-                                                    "fan" => ctx
-                                                        .shared
-                                                        .fan_pin
-                                                        .lock(|pin| {
+                                                    "fan" => (
+                                                        &mut ctx.shared.fan_pin,
+                                                        &mut ctx.shared.fan_pulse_ms,
+                                                    )
+                                                        .lock(|pin, pulse_ms| {
                                                             if state {
                                                                 pin.set_high();
                                                             } else {
                                                                 pin.set_low();
                                                             }
+                                                            *pulse_ms = None;
                                                         }),
                                                     _ => {}
                                                 }
@@ -312,7 +388,10 @@ mod app {
             environment,
             water_pin,
             light_pin,
-            fan_pin
+            fan_pin,
+            water_pulse_ms,
+            light_pulse_ms,
+            fan_pulse_ms
         ],
         local = [telemetry_timer, telemetry_ticks, dht11, delay, adc, soil_pin, i2c]
     )]
@@ -332,6 +411,51 @@ mod app {
                         if *remaining == 0 {
                             buzzer_pin.set_high();
                             actuators.buzzer = false;
+                            *pulse_ms = None;
+                        }
+                    }
+                }
+            });
+
+        // 水泵脉冲控制（高电平触发）
+        (&mut ctx.shared.water_pin, &mut ctx.shared.water_pulse_ms, &mut ctx.shared.actuators)
+            .lock(|pin, pulse_ms, actuators| {
+                if let Some(remaining) = pulse_ms.as_mut() {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            pin.set_low();
+                            *actuators.water() = false;
+                            *pulse_ms = None;
+                        }
+                    }
+                }
+            });
+
+        // 补光灯脉冲控制
+        (&mut ctx.shared.light_pin, &mut ctx.shared.light_pulse_ms, &mut ctx.shared.actuators)
+            .lock(|pin, pulse_ms, actuators| {
+                if let Some(remaining) = pulse_ms.as_mut() {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            pin.set_low();
+                            *actuators.light() = false;
+                            *pulse_ms = None;
+                        }
+                    }
+                }
+            });
+
+        // 风扇脉冲控制
+        (&mut ctx.shared.fan_pin, &mut ctx.shared.fan_pulse_ms, &mut ctx.shared.actuators)
+            .lock(|pin, pulse_ms, actuators| {
+                if let Some(remaining) = pulse_ms.as_mut() {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            pin.set_low();
+                            *actuators.fan() = false;
                             *pulse_ms = None;
                         }
                     }
