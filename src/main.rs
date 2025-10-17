@@ -5,13 +5,14 @@
 // 将 panic 输出到调试串口
 use panic_probe as _;
 
-// 模块化拆分：执行器控制逻辑与通信协议处理
+// 模块化拆分：执行器控制逻辑、通信协议与传感器采集
 mod actuators;
 mod protocol;
+mod sensors;
 
 #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true)]
 mod app {
-    use cortex_m::asm;
+    use cortex_m::{asm, delay::Delay};
     use heapless::String;
     use stm32f1xx_hal::{
         gpio::{gpioa::PA1, GpioExt, Output, PushPull},
@@ -25,6 +26,7 @@ mod app {
     use crate::{
         actuators::{apply_action, handle_buzzer_command, ActuatorState, CommandOutcome},
         protocol::{self, LINE_BUFFER_CAPACITY, TELEMETRY_INTERVAL_MS},
+        sensors::{dht11::Dht11, Environment},
     };
 
     /// 共享资源：串口发送端、执行器状态以及蜂鸣器控制
@@ -32,6 +34,7 @@ mod app {
     struct Shared {
         tx: Tx<USART1>,
         actuators: ActuatorState,
+        environment: Environment,
         buzzer_pin: PA1<Output<PushPull>>,
         buzzer_pulse_ms: Option<u32>,
     }
@@ -43,6 +46,8 @@ mod app {
         line_buf: String<LINE_BUFFER_CAPACITY>,
         telemetry_timer: CounterHz<pac::TIM2>,
         telemetry_ticks: u32,
+        dht11: Dht11,
+        delay: Delay,
     }
 
     /// 系统初始化：配置时钟、外设与定时器
@@ -63,20 +68,23 @@ mod app {
 
         // 拆分 GPIO 寄存器，准备配置所需引脚
         let mut gpioa = ctx.device.GPIOA.split(&mut rcc);
-        let mut gpiob = ctx.device.GPIOB.split(&mut rcc);
+        let gpiob = ctx.device.GPIOB.split(&mut rcc);
+        let mut gpiob_crl = gpiob.crl;
+        let mut gpiob_crh = gpiob.crh;
 
         // 执行器输出引脚，其中蜂鸣器为低电平触发，因此默认拉高关闭
-        let _water_pin = gpiob.pb0.into_push_pull_output(&mut gpiob.crl);
-        let _light_pin = gpiob.pb1.into_push_pull_output(&mut gpiob.crl);
-        let _fan_pin = gpiob.pb10.into_push_pull_output(&mut gpiob.crh);
+        let _water_pin = gpiob.pb0.into_push_pull_output(&mut gpiob_crl);
+        let _light_pin = gpiob.pb1.into_push_pull_output(&mut gpiob_crl);
+        let _fan_pin = gpiob.pb10.into_push_pull_output(&mut gpiob_crh);
         let mut buzzer_pin = gpioa.pa1.into_push_pull_output(&mut gpioa.crl);
         buzzer_pin.set_high();
 
         // 传感器相关引脚保持占位状态，后续接入真实驱动
         let _soil_pin = gpioa.pa0.into_analog(&mut gpioa.crl);
-        let _dht11_pin = gpiob.pb5.into_open_drain_output(&mut gpiob.crl);
-        let _i2c_scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
-        let _i2c_sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
+        let dht_pin = gpiob.pb5.into_floating_input(&mut gpiob_crl);
+        let _i2c_scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob_crl);
+        let _i2c_sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob_crl);
+        let dht11 = Dht11::new(dht_pin, gpiob_crl);
 
         // USART1：PA9 / PA10 作为 TX / RX
         let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
@@ -95,10 +103,14 @@ mod app {
         telemetry_timer.listen(TimerEvent::Update);
         let _ = telemetry_timer.start(1_000.Hz());
 
+        // 创建基于 SYST 的延迟，用于 DHT11 微秒级时序
+        let delay = Delay::new(ctx.core.SYST, rcc.clocks.sysclk().raw());
+
         (
             Shared {
                 tx,
                 actuators: ActuatorState::default(),
+                environment: Environment::default(),
                 buzzer_pin,
                 buzzer_pulse_ms: None,
             },
@@ -107,6 +119,8 @@ mod app {
                 line_buf: String::new(),
                 telemetry_timer,
                 telemetry_ticks: 0,
+                dht11,
+                delay,
             },
             init::Monotonics(),
         )
@@ -216,8 +230,8 @@ mod app {
     #[task(
         binds = TIM2,
         priority = 2,
-        shared = [tx, actuators, buzzer_pin, buzzer_pulse_ms],
-        local = [telemetry_timer, telemetry_ticks]
+        shared = [tx, actuators, buzzer_pin, buzzer_pulse_ms, environment],
+        local = [telemetry_timer, telemetry_ticks, dht11, delay]
     )]
     fn on_tim2(mut ctx: on_tim2::Context) {
         ctx.local
@@ -244,9 +258,24 @@ mod app {
         // 每 TELEMETRY_INTERVAL_MS 毫秒上报一次执行器状态
         if *ctx.local.telemetry_ticks >= TELEMETRY_INTERVAL_MS {
             *ctx.local.telemetry_ticks = 0;
-            (&mut ctx.shared.tx, &mut ctx.shared.actuators).lock(|tx, actuators| {
-                let _ = protocol::send_data(tx, actuators);
+
+            // 读取 DHT11，更新环境数据
+            let reading = ctx.local.dht11.read(ctx.local.delay);
+            ctx.shared.environment.lock(|env| match reading {
+                Ok(data) => {
+                    env.temperature = Some(data.temperature);
+                    env.humidity = Some(data.humidity);
+                }
+                Err(_) => {
+                    env.temperature = None;
+                    env.humidity = None;
+                }
             });
+
+            (&mut ctx.shared.tx, &mut ctx.shared.actuators, &mut ctx.shared.environment)
+                .lock(|tx, actuators, env| {
+                    let _ = protocol::send_data(tx, env, actuators);
+                });
         }
     }
 }

@@ -10,7 +10,7 @@ use stm32f1xx_hal::{
     serial::Tx,
 };
 
-use crate::actuators::ActuatorState;
+use crate::{actuators::ActuatorState, sensors::Environment};
 
 /// 串口接收缓冲区容量（按行缓存 NDJSON）
 pub const LINE_BUFFER_CAPACITY: usize = 192;
@@ -59,18 +59,29 @@ pub fn send_ack(
     Ok(())
 }
 
-/// 发送 data 帧，报告执行器状态
-pub fn send_data(tx: &mut Tx<USART1>, state: &ActuatorState) -> Result<(), ()> {
+/// 发送 data 帧，报告执行器状态与环境数据
+pub fn send_data(
+    tx: &mut Tx<USART1>,
+    env: &Environment,
+    actuators: &ActuatorState,
+) -> Result<(), ()> {
     let mut buf: String<TX_BUFFER_CAPACITY> = String::new();
-    // 传感器数据占位，后续接入真实传感器后替换
     write!(
         buf,
-        "{{\"type\":\"data\",\"temp\":null,\"humi\":null,\"soil\":null,\"lux\":null,\
+        "{{\"type\":\"data\",\"temp\":",
+    )
+    .map_err(|_| ())?;
+    write_option_u8(&mut buf, env.temperature)?;
+    write!(buf, ",\"humi\":").map_err(|_| ())?;
+    write_option_u8(&mut buf, env.humidity)?;
+    write!(
+        buf,
+        ",\"soil\":null,\"lux\":null,\
          \"water\":{},\"light\":{},\"fan\":{},\"buzzer\":{}}}",
-        bool_to_flag(state.water),
-        bool_to_flag(state.light),
-        bool_to_flag(state.fan),
-        bool_to_flag(state.buzzer)
+        bool_to_flag(actuators.water),
+        bool_to_flag(actuators.light),
+        bool_to_flag(actuators.fan),
+        bool_to_flag(actuators.buzzer)
     )
     .map_err(|_| ())?;
     transmit_line(tx, buf.as_bytes());
@@ -83,6 +94,13 @@ fn write_option_string<const N: usize>(
 ) -> Result<(), ()> {
     match value {
         Some(text) => write!(buf, "\"{}\"", text).map_err(|_| ()),
+        None => buf.push_str("null").map_err(|_| ()),
+    }
+}
+
+fn write_option_u8<const N: usize>(buf: &mut String<N>, value: Option<u8>) -> Result<(), ()> {
+    match value {
+        Some(v) => write!(buf, "{}", v).map_err(|_| ()),
         None => buf.push_str("null").map_err(|_| ()),
     }
 }
