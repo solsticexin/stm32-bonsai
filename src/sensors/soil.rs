@@ -17,7 +17,15 @@ impl SoilSensor {
         // 较长采样时间可以提升信号稳定性
         adc.set_sample_time(SampleTime::T_239);
         let raw: u16 = block!(adc.read(pin)).unwrap_or(0u16);
-        // STM32F1 ADC 12bit：0-4095，对应 0-100%
-        ((raw as u32 * 100) / 4095) as u8
+        // 传感器在空气中电阻大，对应高电压；在湿润土壤时电压下降
+        // 因此取反比例：4095 → 0%，0 → 100%
+        let percent = if raw >= 4095 {
+            0
+        } else {
+            100_u32
+                .saturating_sub((raw as u32 * 100) / 4095)
+                .min(100) as u8
+        };
+        percent
     }
 }
