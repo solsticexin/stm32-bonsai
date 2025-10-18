@@ -7,6 +7,7 @@ use panic_probe as _;
 
 // 模块化拆分：执行器控制逻辑、通信协议与传感器采集
 mod actuators;
+mod display;
 mod protocol;
 mod sensors;
 
@@ -17,16 +18,16 @@ mod app {
     use stm32f1xx_hal::{
         adc::Adc,
         gpio::{
-            gpioa::PA0,
-            gpioa::PA1,
+            gpioa::{PA0, PA1, PA2, PA3, PA4},
             gpiob::{PB0, PB1, PB10},
-            Analog, GpioExt, Output, PushPull,
+            Analog, Floating, GpioExt, Output, PushPull,
         },
         i2c::{I2c, Mode},
         pac::{self, USART1},
         prelude::*,
         rcc::Config as RccConfig,
         serial::{Config as SerialConfig, Event as SerialEvent, Rx, Serial, Tx},
+        spi::{Mode as SpiMode, Phase, Polarity, Spi, SpiExt},
         timer::{CounterHz, Event as TimerEvent, Timer},
     };
 
@@ -35,12 +36,20 @@ mod app {
             apply_action, handle_buzzer_command, ActuatorState, CommandOutcome, MAX_PULSE_MS,
             MIN_PULSE_MS,
         },
+        display::St7735Display,
         protocol::{self, LINE_BUFFER_CAPACITY, TELEMETRY_INTERVAL_MS},
         sensors::{bh1750::Bh1750, dht11::Dht11, soil::SoilSensor, Environment},
     };
 
     /// 共享资源：串口发送端、执行器状态以及蜂鸣器控制
     type LightI2c = I2c<pac::I2C1>;
+    type DisplaySpi = Spi<pac::SPI1, u8, Floating>;
+    type DisplayDriver = St7735Display<
+        DisplaySpi,
+        PA4<Output<PushPull>>,
+        PA2<Output<PushPull>>,
+        PA3<Output<PushPull>>,
+    >;
 
     #[shared]
     struct Shared {
@@ -69,6 +78,7 @@ mod app {
         adc: Adc<pac::ADC1>,
         soil_pin: PA0<Analog>,
         i2c: LightI2c,
+        display: DisplayDriver,
     }
 
     /// 系统初始化：配置时钟、外设与定时器
@@ -131,11 +141,34 @@ mod app {
 
         // TIM2 作为 1kHz 基准计时器，用于遥测与蜂鸣器脉冲计时
         let mut telemetry_timer = Timer::new(ctx.device.TIM2, &mut rcc).counter_hz();
-        telemetry_timer.listen(TimerEvent::Update);
-        let _ = telemetry_timer.start(1_000.Hz());
+       telemetry_timer.listen(TimerEvent::Update);
+       let _ = telemetry_timer.start(1_000.Hz());
 
-        // 创建基于 SYST 的延迟，用于 DHT11 微秒级时序
-        let delay = Delay::new(ctx.core.SYST, rcc.clocks.sysclk().raw());
+        // 创建基于 SYST 的延迟，用于 DHT11 微秒级时序及显示屏初始化
+        let mut delay = Delay::new(ctx.core.SYST, rcc.clocks.sysclk().raw());
+
+        // SPI 显示屏：ST7735
+        let sck = gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl);
+        let miso = gpioa.pa6.into_floating_input(&mut gpioa.crl);
+        let mosi = gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl);
+        let mut dc = gpioa.pa4.into_push_pull_output(&mut gpioa.crl);
+        let mut rst = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
+        let mut cs = gpioa.pa3.into_push_pull_output(&mut gpioa.crl);
+        cs.set_high();
+        rst.set_high();
+        dc.set_high();
+        let spi_mode = SpiMode {
+            polarity: Polarity::IdleLow,
+            phase: Phase::CaptureOnFirstTransition,
+        };
+        let spi = ctx
+            .device
+            .SPI1
+            .spi((Some(sck), Some(miso), Some(mosi)), spi_mode, 8.MHz(), &mut rcc);
+        let mut display = St7735Display::new(spi, dc, rst, cs);
+        let _ = display.init(&mut delay);
+        let _ = display.render_environment(&Environment::default());
+
         let adc = Adc::new(ctx.device.ADC1, &mut rcc);
 
         (
@@ -162,6 +195,7 @@ mod app {
                 adc,
                 soil_pin,
                 i2c,
+                display,
             },
             init::Monotonics(),
         )
@@ -393,7 +427,7 @@ mod app {
             light_pulse_ms,
             fan_pulse_ms
         ],
-        local = [telemetry_timer, telemetry_ticks, dht11, delay, adc, soil_pin, i2c]
+        local = [telemetry_timer, telemetry_ticks, dht11, delay, adc, soil_pin, i2c, display]
     )]
     fn on_tim2(mut ctx: on_tim2::Context) {
         ctx.local
@@ -486,6 +520,9 @@ mod app {
                 env.soil = Some(soil_percent);
                 env.lux = lux_result.ok();
             });
+
+            let env_snapshot = ctx.shared.environment.lock(|env| *env);
+            let _ = ctx.local.display.render_environment(&env_snapshot);
 
             (&mut ctx.shared.tx, &mut ctx.shared.actuators, &mut ctx.shared.environment)
                 .lock(|tx, actuators, env| {
