@@ -1,8 +1,8 @@
 [package]
 name = "stm32-bonsai"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["solsticexin <solstice.xin@gmail.com>"]
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 cortex-m = "0.7"
