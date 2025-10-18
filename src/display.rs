@@ -208,7 +208,7 @@ where
         let _ = line.push_str("Light:");
         match env.lux {
             Some(value) => {
-                let _ = write!(line, " {}lux", value);
+                let _ = write!(line, "{} lux", value);
             }
             None => {
                 let _ = line.push_str(" --");
